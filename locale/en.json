@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Idea archive",
+    "description": "Keeps the projects you explored for a few minutes so you can come back to them. Each idea stores your own thought and time estimate, the research links you collected, and the chat logs you saved (duck.ai exports are parsed into questions and answers). Open it from the archive icon in the left sidebar: create an idea, add links, attach a downloaded chat log, and move it from Idea to In progress or Done. The agent can also save ideas and attach logs while you research. Everything is kept in an idea-archive folder under your DSH home and stays on this machine; removing the bundle hides the page but leaves the files in place.",
+    "detail": "docs/DETAIL.md"
+  }
+}

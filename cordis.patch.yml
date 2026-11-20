@@ -1,0 +1,3 @@
+- insert:
+    - id: idea-archive
+      name: '@local/idea-archive'
