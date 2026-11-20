@@ -230,3 +230,84 @@ test('display resources are valid', async () => {
   assert.match(preview, /viewBox="0 0 640 300"/u)
   assert.ok(!/<text|<script|foreignObject/u.test(preview))
 })
+
+test('exports a whole archive and imports it into a fresh archive', async () => {
+  const source = await scratch()
+  const target = await scratch()
+  process.env.DSH_IDEA_ARCHIVE_DIR = source
+  try {
+    const original = mount()
+    const created = await call(original.route, 'POST', '', JSON.stringify({
+      action: 'create',
+      title: 'Router idea',
+      note: 'Simple project.',
+      estimate: 'About 1 hour',
+      links: ['OpenWrt wiki | https://openwrt.org/toh/cudy/wr1300_v3'],
+    }))
+    const ideaId = created.json.idea.id
+    await call(original.route, 'POST', '', JSON.stringify({
+      action: 'attach-log', id: ideaId, name: 'duck.ai export', text: sample,
+    }))
+
+    const exported = await call(original.route, 'GET', '?view=export')
+    assert.equal(exported.status, 200)
+    assert.equal(exported.json.format, 'dsh-idea-archive')
+    assert.equal(exported.json.ideas.length, 1)
+    assert.equal(exported.json.ideas[0].title, 'Router idea')
+    assert.equal(exported.json.ideas[0].links.length, 1)
+    assert.equal(exported.json.ideas[0].logs.length, 1)
+    assert.match(exported.json.ideas[0].logs[0].text, /generated with Duck\.ai/u)
+
+    // A fresh instance: same plugin, empty archive, import the file.
+    process.env.DSH_IDEA_ARCHIVE_DIR = target
+    const fresh = mount()
+    const imported = await call(fresh.route, 'POST', '', JSON.stringify({
+      action: 'import', archive: exported.json,
+    }))
+    assert.equal(imported.status, 200)
+    assert.deepEqual(imported.json, { ok: true, imported: 1, skipped: 0, invalid: 0, logs: 1 })
+
+    const list = await call(fresh.route, 'GET')
+    assert.equal(list.json.ideas.length, 1)
+    assert.equal(list.json.ideas[0].linkCount, 1)
+    assert.equal(list.json.ideas[0].logCount, 1)
+
+    const detail = await call(fresh.route, 'GET', `?view=idea&id=${list.json.ideas[0].id}`)
+    assert.equal(detail.json.idea.note, 'Simple project.')
+    assert.equal(detail.json.idea.estimate, 'About 1 hour')
+    assert.equal(detail.json.logs[0].turns.length, 8)
+
+    // Importing the same file again merges without duplicating.
+    const again = await call(fresh.route, 'POST', '', JSON.stringify({
+      action: 'import', archive: exported.json,
+    }))
+    assert.deepEqual(again.json, { ok: true, imported: 0, skipped: 1, invalid: 0, logs: 0 })
+    assert.equal((await call(fresh.route, 'GET')).json.ideas.length, 1)
+  } finally {
+    delete process.env.DSH_IDEA_ARCHIVE_DIR
+    await rm(source, { recursive: true, force: true })
+    await rm(target, { recursive: true, force: true })
+  }
+})
+
+test('rejects a file that is not an idea archive export', async () => {
+  const root = await scratch()
+  process.env.DSH_IDEA_ARCHIVE_DIR = root
+  try {
+    const { route } = mount()
+    const wrong = await call(route, 'POST', '', JSON.stringify({ action: 'import', archive: { hello: 'world' } }))
+    assert.equal(wrong.status, 400)
+    assert.match(wrong.json.error, /not an Idea archive export/u)
+
+    const malformed = await call(route, 'POST', '', JSON.stringify({
+      action: 'import',
+      archive: { format: 'dsh-idea-archive', ideas: [{ title: '' }, null, { title: 'Kept' }] },
+    }))
+    assert.equal(malformed.status, 200)
+    assert.equal(malformed.json.imported, 1)
+    assert.equal(malformed.json.invalid, 2)
+  } finally {
+    delete process.env.DSH_IDEA_ARCHIVE_DIR
+    await rm(root, { recursive: true, force: true })
+  }
+})

@@ -35,10 +35,16 @@ const MAX_URL = 2_000
 const MAX_LINK_TITLE = 300
 const MAX_LOG_NAME = 200
 const MAX_LOG_TEXT = 4 * 1024 * 1024
-/** Generous enough for a 4 MiB transcript plus JSON escaping. */
-const MAX_BODY_BYTES = MAX_LOG_TEXT + 1024 * 1024
+/** Generous enough for one 4 MiB transcript plus JSON escaping, and for a
+ * whole-archive import with its inlined logs. */
+const MAX_BODY_BYTES = 72 * 1024 * 1024
 /** How much of the transcript the agent tool sends back. */
 const MAX_TOOL_LOG_CHARS = 24_000
+/** Export document marker; a file without it is not an idea archive. */
+const EXPORT_FORMAT = 'dsh-idea-archive'
+/** Import ceilings: a personal archive stays far below these. */
+const MAX_IMPORT_IDEAS = 1_000
+const MAX_IMPORT_LOG_BYTES = 32 * 1024 * 1024
 /** Browser endpoint for both reads and mutations. */
 const API_ROUTE = '/idea-archive/api'
 
@@ -359,6 +365,56 @@ function readLinks(raw) {
   return raw.map(readLink)
 }
 
+/**
+ * Validate one idea from an export document. Field problems degrade to a
+ * skipped field, so one long note cannot reject a whole backup.
+ * @param {unknown} raw exported idea.
+ * @returns {object | undefined} the importable idea, or undefined when it has no title.
+ */
+function readImportedIdea(raw) {
+  if (raw === null || typeof raw !== 'object') return undefined
+  const title = typeof raw.title === 'string' ? raw.title.trim().slice(0, MAX_TITLE) : ''
+  if (title === '') return undefined
+  const at = nowIso()
+  const created = typeof raw.createdAt === 'string' ? Date.parse(raw.createdAt) : Number.NaN
+  const updated = typeof raw.updatedAt === 'string' ? Date.parse(raw.updatedAt) : Number.NaN
+  const createdAt = Number.isFinite(created) ? new Date(created).toISOString() : at
+  const links = []
+  if (Array.isArray(raw.links)) {
+    for (const item of raw.links) {
+      const url = normalizeUrl(item?.url)
+      if (url === '') continue
+      links.push({
+        id: newId('link'),
+        url,
+        title: typeof item.title === 'string' ? item.title.trim().slice(0, MAX_LINK_TITLE) : '',
+        addedAt: normalizeTime(item.addedAt),
+      })
+    }
+  }
+  const logs = []
+  if (Array.isArray(raw.logs)) {
+    for (const item of raw.logs) {
+      const text = typeof item?.text === 'string' ? item.text : ''
+      if (text.trim() === '' || Buffer.byteLength(text) > MAX_LOG_TEXT) continue
+      const name = typeof item.name === 'string' && item.name.trim() !== ''
+        ? item.name.trim().slice(0, MAX_LOG_NAME)
+        : 'Chat log'
+      logs.push({ name, text, addedAt: normalizeTime(item.addedAt) })
+    }
+  }
+  return {
+    title,
+    note: typeof raw.note === 'string' ? raw.note.slice(0, MAX_NOTE) : '',
+    estimate: typeof raw.estimate === 'string' ? raw.estimate.slice(0, MAX_ESTIMATE) : '',
+    status: normalizeStatus(raw.status),
+    createdAt,
+    updatedAt: Number.isFinite(updated) ? new Date(updated).toISOString() : createdAt,
+    links,
+    logs,
+  }
+}
+
 /** @param {object} idea stored idea. @returns {string} Markdown that reproduces the archive entry. */
 function ideaMarkdown(idea) {
   const lines = [`# ${idea.title}`, '']
@@ -657,6 +713,131 @@ export class IdeaStore {
   }
 
   /**
+   * One portable snapshot of the archive: every idea with its transcripts
+   * inlined, so a single JSON file restores the archive on another machine.
+   * @returns {Promise<object>} the export document.
+   */
+  async exportArchive() {
+    await this.tail
+    const state = await this.load()
+    const ideas = []
+    for (const idea of state.ideas) {
+      const logs = []
+      for (const log of idea.logs) {
+        let text = ''
+        try {
+          text = await readFile(logPath({ ...idea, root: this.root }, log), 'utf8')
+        } catch (error) {
+          if (error?.code !== 'ENOENT') console.warn(`[idea-archive] Cannot read ${log.file}: ${error?.message ?? error}`)
+        }
+        if (text === '') continue
+        logs.push({
+          name: log.name,
+          kind: log.kind,
+          model: log.model,
+          promptCount: log.promptCount,
+          addedAt: log.addedAt,
+          text,
+        })
+      }
+      ideas.push({
+        title: idea.title,
+        note: idea.note,
+        estimate: idea.estimate,
+        status: idea.status,
+        createdAt: idea.createdAt,
+        updatedAt: idea.updatedAt,
+        links: idea.links.map(link => ({ url: link.url, title: link.title, addedAt: link.addedAt })),
+        logs,
+      })
+    }
+    return {
+      format: EXPORT_FORMAT,
+      version: 1,
+      plugin: 'idea-archive',
+      exportedAt: nowIso(),
+      ideas,
+    }
+  }
+
+  /**
+   * Merge one export document into this archive. An idea already present
+   * (same title and creation instant) is skipped, so re-importing a backup is
+   * safe; every imported idea and transcript receives a fresh id.
+   * @param {unknown} input the exported document.
+   * @returns {Promise<{imported: number, skipped: number, invalid: number, logs: number}>} the outcome.
+   */
+  async importArchive(input) {
+    if (input === null || typeof input !== 'object' || input.format !== EXPORT_FORMAT || !Array.isArray(input.ideas)) {
+      throw new ArchiveError('That file is not an Idea archive export.')
+    }
+    if (input.ideas.length > MAX_IMPORT_IDEAS) {
+      throw new ArchiveError(`An export can hold at most ${MAX_IMPORT_IDEAS} ideas.`)
+    }
+    const entries = input.ideas.map(raw => ({ raw, entry: readImportedIdea(raw) }))
+    let bytes = 0
+    for (const { entry } of entries) {
+      if (entry === undefined) continue
+      for (const log of entry.logs) bytes += Buffer.byteLength(log.text)
+    }
+    if (bytes > MAX_IMPORT_LOG_BYTES) {
+      throw new ArchiveError('That export holds more than 32 MiB of chat logs.')
+    }
+    return this.run(async draft => {
+      const known = new Set(draft.ideas.map(idea => `${idea.title}\u0000${idea.createdAt}`))
+      let imported = 0
+      let skipped = 0
+      let invalid = 0
+      let logs = 0
+      for (const { entry } of entries) {
+        if (entry === undefined) {
+          invalid += 1
+          continue
+        }
+        const key = `${entry.title}\u0000${entry.createdAt}`
+        if (known.has(key)) {
+          skipped += 1
+          continue
+        }
+        known.add(key)
+        const ideaId = newId('idea')
+        const directory = join(this.root, 'logs', ideaId)
+        const stored = []
+        for (const log of entry.logs) {
+          const logId = newId('log')
+          await mkdir(directory, { recursive: true, mode: 0o700 })
+          await writeFile(join(directory, `${logId}.txt`), log.text, { encoding: 'utf8', mode: 0o600 })
+          const parsed = parseTranscript(log.text)
+          stored.push({
+            id: logId,
+            name: log.name,
+            file: `${logId}.txt`,
+            kind: parsed.kind,
+            model: parsed.model.slice(0, 120),
+            promptCount: parsed.promptCount,
+            size: Buffer.byteLength(log.text),
+            addedAt: log.addedAt,
+          })
+          logs += 1
+        }
+        draft.ideas.push({
+          id: ideaId,
+          title: entry.title,
+          note: entry.note,
+          estimate: entry.estimate,
+          status: entry.status,
+          links: entry.links,
+          logs: stored,
+          createdAt: entry.createdAt,
+          updatedAt: entry.updatedAt,
+        })
+        imported += 1
+      }
+      return { imported, skipped, invalid, logs }
+    })
+  }
+
+  /**
    * Dispatch one browser mutation.
    * @param {Record<string, unknown>} body action and its fields.
    * @returns {Promise<object>} the result payload.
@@ -693,6 +874,9 @@ export class IdeaStore {
       case 'delete': {
         return { ok: true, ...(await this.deleteIdea(id)) }
       }
+      case 'import': {
+        return { ok: true, ...(await this.importArchive(body?.archive)) }
+      }
       default:
         throw new ArchiveError(`Unknown action "${action}".`)
     }
@@ -717,9 +901,11 @@ function createHandler(store) {
       const url = new URL(req.url ?? '/', 'http://localhost')
       if (req.method === 'GET' || req.method === 'HEAD') {
         const view = url.searchParams.get('view') ?? 'list'
-        const payload = view === 'idea'
-          ? await store.detail(url.searchParams.get('id') ?? '')
-          : { ...(await store.overview()), storage: store.root }
+        const payload = view === 'export'
+          ? await store.exportArchive()
+          : view === 'idea'
+            ? await store.detail(url.searchParams.get('id') ?? '')
+            : { ...(await store.overview()), storage: store.root }
         sendJson(res, 200, payload, req.method === 'HEAD')
         return
       }

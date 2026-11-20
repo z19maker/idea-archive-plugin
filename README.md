@@ -16,6 +16,15 @@ Copy this directory somewhere permanent, then in DeepSeek Harness open
 bundle when the plugin manager offers it. There is no build step: the Host half
 and the browser page are plain ES modules.
 
+## Backup and transfer
+
+**Export** in the page header downloads one JSON file containing every idea,
+its links, and the full text of every saved chat log. **Import** merges such a
+file back into the archive: an idea already present (same title and creation
+time) is skipped, so importing twice is safe, and everything else is added with
+fresh ids. Use it after installing the plugin on another machine or in another
+DSH home.
+
 ## Where to find it
 
 After the bundle is enabled, open **Idea archive** from the archive icon in the
@@ -46,3 +55,4 @@ again.
 - A duck.ai export is recognized by its `User prompt N of M` question headers.
   Any other text file is kept and shown verbatim.
 - The archive is local to this DSH home; it is not synced between machines.
+  Move it with the page's Export and Import buttons.

@@ -21,6 +21,7 @@ window.__ModuleLoader__.load({
     const PANEL_ID = 'idea-archive'
     const API = '/idea-archive/api'
     const MAX_LOG_BYTES = 4 * 1024 * 1024
+    const MAX_IMPORT_FILE = 48 * 1024 * 1024
 
     const dictionaries = {
       en: {
@@ -105,6 +106,17 @@ window.__ModuleLoader__.load({
         editLinksHint: 'Research links and chat logs are managed on the idea page.',
         noIdeasView: 'No ideas in this view.',
         removeConfirm: 'Remove?',
+        importButton: 'Import',
+        exportButton: 'Export',
+        importing: 'Importing…',
+        exporting: 'Exporting…',
+        exported: 'Archive exported. Keep that file to restore your ideas on another instance.',
+        importDone: 'Imported {ideas} ideas and {logs} chat logs.',
+        importSkipped: 'Skipped {skipped} already in this archive.',
+        importInvalid: 'Skipped {invalid} invalid entries.',
+        importNothing: 'Nothing was imported.',
+        invalidExport: 'That file is not an Idea archive export.',
+        importTooLarge: 'That export is too large to import.',
       },
       zh: {
         panel: '想法归档',
@@ -188,6 +200,17 @@ window.__ModuleLoader__.load({
         editLinksHint: '调研链接和聊天记录在想法详情页管理。',
         noIdeasView: '此视图没有想法。',
         removeConfirm: '移除？',
+        importButton: '导入',
+        exportButton: '导出',
+        importing: '正在导入…',
+        exporting: '正在导出…',
+        exported: '归档已导出。请保留该文件，以便在另一个实例中恢复想法。',
+        importDone: '已导入 {ideas} 个想法和 {logs} 份聊天记录。',
+        importSkipped: '跳过 {skipped} 条已存在的想法。',
+        importInvalid: '跳过 {invalid} 条无效内容。',
+        importNothing: '没有导入任何内容。',
+        invalidExport: '这不是想法归档导出的文件。',
+        importTooLarge: '该导出文件过大，无法导入。',
       },
     }
 
@@ -212,6 +235,11 @@ window.__ModuleLoader__.load({
 
     function plural(t, count, one, many) {
       return `${count} ${count === 1 ? t(one) : t(many)}`
+    }
+
+    /** Fill a localized template such as `Imported {ideas} ideas and {logs} logs.` */
+    function fill(template, values) {
+      return String(template).replace(/\{(\w+)\}/gu, (whole, key) => String(values[key] ?? whole))
     }
 
     /** Parse the links textarea into link objects. */
@@ -482,6 +510,7 @@ window.__ModuleLoader__.load({
       const [confirming, setConfirming] = React.useState(false)
       const [pendingRemoval, setPendingRemoval] = React.useState({ kind: '', id: '' })
       const uploadRef = React.useRef(null)
+      const transferRef = React.useRef(null)
       const bodyRef = React.useRef(null)
       const headingRef = React.useRef(null)
       const searchRef = React.useRef(null)
@@ -749,6 +778,59 @@ window.__ModuleLoader__.load({
         }
       }
 
+      const startImport = () => {
+        transferRef.current?.click()
+      }
+
+      /** Download one self-contained JSON file with every idea and transcript. */
+      const exportArchive = async () => {
+        setBusy('export')
+        setError('')
+        try {
+          const data = await requestJson(`${API}?view=export`)
+          const name = `idea-archive-${new Date().toISOString().slice(0, 10)}.json`
+          const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+          const url = URL.createObjectURL(blob)
+          const anchor = document.createElement('a')
+          anchor.href = url
+          anchor.download = name
+          anchor.click()
+          window.setTimeout(() => { URL.revokeObjectURL(url) }, 1_000)
+          setNotice(t('exported'))
+        } catch (failure) {
+          setError(failure?.message === 'network' ? t('loadFailed') : failure?.message ?? t('genericError'))
+        } finally {
+          setBusy('')
+        }
+      }
+
+      /** Merge one exported JSON file into this archive. */
+      const importArchive = async file => {
+        setBusy('import')
+        setError('')
+        setHostNotice('')
+        try {
+          if (file.size > MAX_IMPORT_FILE) throw new Error(t('importTooLarge'))
+          let parsed
+          try {
+            parsed = JSON.parse(await file.text())
+          } catch (failure) {
+            throw new Error(t('invalidExport'))
+          }
+          const result = await mutate({ action: 'import', archive: parsed })
+          const parts = []
+          if (result.imported > 0) parts.push(fill(t('importDone'), { ideas: result.imported, logs: result.logs }))
+          if (result.skipped > 0) parts.push(fill(t('importSkipped'), { skipped: result.skipped }))
+          if (result.invalid > 0) parts.push(fill(t('importInvalid'), { invalid: result.invalid }))
+          setNotice(parts.length === 0 ? t('importNothing') : parts.join(' '))
+          await loadList()
+        } catch (failure) {
+          setError(failure?.message === 'network' ? t('loadFailed') : failure?.message ?? t('genericError'))
+        } finally {
+          setBusy('')
+        }
+      }
+
       const filtered = ideas.filter(idea => {
         if (filter !== 'all' && idea.status !== filter) return false
         if (query.trim() === '') return true
@@ -998,7 +1080,33 @@ window.__ModuleLoader__.load({
             h('div', null,
               h('h1', { className: 'ia-title' }, t('title')),
               h('p', { className: 'ia-sub' }, t('subtitle'))),
-            mode === 'browse' && h('button', { type: 'button', className: 'ia-btn ia-btn-primary', onClick: startCreate }, `+ ${t('newIdea')}`))),
+            h('div', { className: 'ia-actions' },
+              h('button', {
+                type: 'button',
+                className: 'ia-btn',
+                onClick: startImport,
+                disabled: busy === 'import',
+              }, busy === 'import' ? t('importing') : t('importButton')),
+              h('button', {
+                type: 'button',
+                className: 'ia-btn',
+                onClick: exportArchive,
+                disabled: busy === 'export',
+              }, busy === 'export' ? t('exporting') : t('exportButton')),
+              h('input', {
+                ref: transferRef,
+                type: 'file',
+                accept: '.json,application/json',
+                className: 'ia-hidden-input',
+                tabIndex: -1,
+                'aria-label': t('importButton'),
+                onChange: event => {
+                  const file = event.target.files?.[0]
+                  event.target.value = ''
+                  if (file !== undefined) void importArchive(file)
+                },
+              }),
+              mode === 'browse' && h('button', { type: 'button', className: 'ia-btn ia-btn-primary', onClick: startCreate }, `+ ${t('newIdea')}`)))),
         h('div', { ref: bodyRef, className: 'ia-body' },
           h('div', { className: 'ia-column' }, banners, body)))
     }
@@ -1039,6 +1147,7 @@ window.__ModuleLoader__.load({
 .ia-head-inner { max-width: 960px; margin: 0 auto; display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
 .ia-title { margin: 0; font-size: 20px; line-height: 28px; font-weight: 500; letter-spacing: -0.01em; }
 .ia-sub { margin: 4px 0 0; font-size: 13px; line-height: 19px; color: var(--dsw-alias-label-secondary); }
+.ia-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .ia-body { flex: 1; min-height: 0; overflow-y: auto; scrollbar-gutter: stable; padding: 6px clamp(20px, 4vw, 48px) 48px; }
 .ia-column { max-width: 960px; margin: 0 auto; display: flex; flex-direction: column; gap: 14px; }
 .ia-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
